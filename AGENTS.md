@@ -1,50 +1,63 @@
 # AGENTS.md
 
-User docs: **README.md**. This file is only operating knowledge the code can't tell you.
+Agent operating knowledge only. Each fact lives in one place:
 
-## Deploy
+| Topic | Owner |
+| --- | --- |
+| What the bot does, bot commands, config keys, build/deploy, security model | `README.md` |
+| CI gates (fmt, clippy `-D warnings`, tests, mipsel cross build, release upload) | `.github/workflows/ci.yml` |
+| Toolchain download URL, linker wiring | `build.sh` |
+| Router install steps | `deploy.sh` |
+| procd service definition | `openwrt/tgbot.init` |
+
+## Dev loop
 
 ```sh
-cargo test --release                                   # always
-./build.sh                                             # mipsel + nightly + build-std
-./deploy.sh                                            # ROUTER defaults to root@192.168.1.1
-ROUTER=root@my-router ./deploy.sh                      # any ssh target
+cargo fmt && cargo clippy --release -- -D warnings && cargo test --release   # what CI runs
+cargo test --release parses_wake                                            # one test by name filter
+./build.sh && ./deploy.sh                                                   # ship to the router
 ```
 
-`./deploy.sh` = scp binary + init script, restart service. That's the whole release flow.
+Unit tests cover pure logic only (parsers, table/message rendering). Anything touching
+`/proc`, `ubus`, `ping`, `curl` or Telegram is verified on the router: `logread | grep tgbot`.
 
-## Principles
+## Architecture
 
-- **Never reinvent the wheel.** Reach for a crate first: tables → `tabled` (+ `<pre>`,
-  Telegram collapses plain spaces), WoL → `wake-on-lan`. Hand-rolled padding/parsers only
-  when no library fits, and keep the reason in the PR.
-- **Keep the module split** (`config` / `telegram` / `system` / `commands` / `monitor` /
-  `main`). New features get a module, not another 200 lines in `main.rs`.
-- **Minimal deps that cross-compile.** No async runtimes, no reqwest/ureq/teloxide:
-  rustls/ring have no MIPS target. HTTPS rides the router's `curl` — don't change this
-  without checking the cross build.
-- Tests before deploy; `cargo test --release` covers the pure logic.
+```
+main.rs   long-poll getUpdates (25s) ──► commands::handle_message / handle_callback
+   │                                         │  shell-outs via system.rs (/proc, ubus, ping, logread)
+   │                                         │  replies via telegram.rs (curl, HTML parse mode)
+   │                                         └─ /wake, /watch ──spawn──► watcher.rs thread (5s poll, 3 min)
+   └─ spawn at start ──► monitor.rs thread (20s presence diff over `monitor=` entries)
+```
 
-## Gotchas
+- `Config` is cloned into each thread at spawn time; there is no shared mutable state.
+  Consequence: the presence monitor exits if `chat_id == 0` at startup, so after first
+  pairing restart the service to get presence alerts.
+- Pairing (`/start <pair_code>`) rewrites `chat_id=` in the config file in place
+  (`Config::persist_chat_id`, tmp file + rename). Every message and callback from another
+  chat is dropped silently.
+- Inline buttons carry state in `callback_data` (`wake:<MAC>`, `reboot_yes`, `reboot_no`);
+  `handle_callback` must answer with `answerCallbackQuery` or the client spinner hangs.
+- Replies use Telegram HTML parse mode: escape every dynamic string with `telegram::esc`,
+  render tables with `tabled` inside `<pre>` (Telegram collapses plain-space alignment).
 
-- Router is **soft-float musl**: build with a `mipsel-*muslsf` toolchain (`build.sh` prints where to get one) or the binary dies
-  with `not found` (loader is `/lib/ld-musl-mipsel-sf.so.1`).
-- **One bot process only** — two pollers make Telegram silent for both. After deploy:
+## Rules
+
+- **Crate before hand-rolling** (tables `tabled`, WoL `wake-on-lan`), but only crates that
+  cross-compile to mipsel musl: no async runtime, no TLS stack (why: README "Design goal").
+  HTTPS stays on the router's `curl`; changing that needs a green `./build.sh` first.
+- **Module per feature**; `main.rs` stays routing only.
+- **Never pass the token in argv** — `ps` shows argv to every router user. `telegram::api`
+  feeds the URL to `curl -K -` on stdin.
+- Validate user-supplied arguments before they reach a shell-out (see `/ping`: must parse
+  as `IpAddr`). `system::sh` runs `/bin/sh -c`, so never interpolate chat text into it.
+
+## Router gotchas
+
+- **Soft-float musl.** A hard-float binary fails with `not found` (only loader is
+  `/lib/ld-musl-mipsel-sf.so.1`).
+- **One poller only.** Two `tgbot` processes make Telegram silent for both. After deploy:
   `ssh $ROUTER 'ps w | grep "[t]gbot"'`, kill strays, `/etc/init.d/tgbot status`.
-- Config is read at start only → restart after editing `/etc/tgbot.conf`.
-- Verify bot behaviour on the router (`logread | grep tgbot`), not only via unit tests.
-- Router runs BusyBox: `sh` not `bash`, no `pkill` — kill by PID via `ps w | awk`.
-- Token never goes in git. `/etc/tgbot.conf` on the router, `chmod 600`.
-
-## Map
-
-```
-src/main.rs      poll loop, update routing
-src/config.rs    /etc/tgbot.conf parsing
-src/telegram.rs  Bot API via curl, HTML escaping
-src/system.rs    /proc + ubus readers, ping, WoL
-src/commands.rs  handlers, tables, callbacks, unit tests
-src/monitor.rs   LAN presence watcher (20s)
-src/watcher.rs   post-wake "is it up" watcher (5s poll, 3 min deadline)
-openwrt/         init script, config example
-```
+- Config is read at start only: restart after editing `/etc/tgbot.conf`.
+- BusyBox: `sh` not `bash`, no `pkill`; kill by PID via `ps w | awk`.

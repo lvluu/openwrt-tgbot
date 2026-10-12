@@ -6,7 +6,7 @@
 Tiny Telegram bot to control and monitor an OpenWrt router.
 
 Runs as a procd service on the router. Built and tested on ramips/mt7621 (mipsel, soft-float musl,
-e.g. OpenWrt/X-WRT), but any target Rust can cross-compile to works. Device presence alerts included.
+e.g. OpenWrt/X-WRT); other targets need their own cross toolchain.
 
 Design goal: minimal resource use. One static `mipsel-unknown-linux-musl` binary (~570 KB),
 single-threaded long-poll loop, HTTPS via the router's own `curl` (no TLS library linked in,
@@ -27,31 +27,21 @@ which also sidesteps rustls/ring having no MIPS support). Typical RSS ~4 MB.
 | `/restartwifi` | restart networking |
 | `/reboot` | reboot with an inline confirm/cancel button |
 
-Tables are rendered with the [`tabled`](https://crates.io/crates/tabled) crate inside
-`<pre>` blocks (box-drawing characters align reliably; plain spaces get collapsed by
-Telegram clients). Wake-on-LAN uses [`wake-on-lan`](https://crates.io/crates/wake-on-lan)
-and can blast to extra broadcast domains via config (needed when the target machine sits
-on a different subnet, e.g. behind an ISP gateway).
-
-Also pushes messages when a monitored device joins/leaves the LAN.
+Also pushes a message when a `monitor=` device joins or leaves the LAN.
 
 ## Build
 
 ```sh
 ./build.sh          # cross-compile for the router (nightly + build-std)
-./build.sh host     # native build, useful for `cargo test`
-cargo test --release
+./build.sh host     # native build
 ```
 
 Requirements: Rust nightly with `rust-src` (`rustup toolchain install nightly --component rust-src`)
 and a mipsel soft-float musl cross toolchain:
 
-```sh
-mkdir -p toolchain && curl -fsSL https://github.com/cross-tools/musl-cross/releases/download/20261001/mipsel-unknown-linux-muslsf.tar.xz | tar xJ -C toolchain
-```
-
-Any `mipsel-*muslsf-gcc` toolchain works (musl.cc too); point `TOOLCHAIN_DIR=...` at it (the `sf` variant matters — many mt7621 builds ship soft-float musl, hard-float binaries get
-"not found" because `/lib/ld-musl-mipsel-sf.so.1` is the only loader).
+`./build.sh` prints the download command when the toolchain is missing. Any
+`mipsel-*muslsf-gcc` toolchain works; point `TOOLCHAIN_DIR=...` at it. It must be the
+soft-float (`sf`) variant.
 
 ## Prebuilt binary
 
@@ -65,16 +55,16 @@ workflow run artifacts, or from the release page for `v*` tags.
 ROUTER=root@my-router ./deploy.sh    # any ssh target (LAN IP, Tailscale name, ...)
 ```
 
-`deploy.sh` scp's the binary and init script, then restarts the service. Redeploys are
-always: rebuild → scp → restart. The paired `chat_id` persists in the router's config.
+`deploy.sh` copies the binary and init script, then restarts the service. The paired
+`chat_id` persists in the router's config across redeploys.
 
 ## Router files
 
 | Path | Purpose |
 | --- | --- |
 | `/usr/bin/tgbot` | binary |
-| `/etc/tgbot.conf` | config (token, chat_id, pair_code, monitor/wake lists) |
-| `/etc/init.d/tgbot` | procd service (`START=95`, respawn on crash) |
+| `/etc/tgbot.conf` | config, keys below |
+| `/etc/init.d/tgbot` | procd service (respawns on crash) |
 
 Config format (`openwrt/tgbot.conf.example`), one `key=value` per line:
 
@@ -85,7 +75,7 @@ Config format (`openwrt/tgbot.conf.example`), one `key=value` per line:
 | `pair_code` | secret you send with `/start` to pair |
 | `monitor=<ip>:<name>` | push a message when this device joins/leaves (repeatable) |
 | `wake=<mac>:<name>` | machine offered by `/wake` (repeatable) |
-| `wake_bcast=<addr>` | extra broadcast address for WoL packets (repeatable) |
+| `wake_bcast=<addr>` | extra WoL broadcast address, for machines on another subnet (repeatable) |
 
 ## Security notes
 
@@ -98,7 +88,6 @@ Config format (`openwrt/tgbot.conf.example`), one `key=value` per line:
 
 [MIT](LICENSE)
 
-## For AI agents
+## Contributing
 
-See [AGENTS.md](AGENTS.md) — build/deploy workflow, remote (Tailscale) access, and the
-gotchas that bite when touching this code.
+Dev loop, architecture and router gotchas: [AGENTS.md](AGENTS.md).
