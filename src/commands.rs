@@ -70,7 +70,11 @@ pub fn wake_report(name: &str, res: &Result<usize, String>) -> String {
             n,
             if *n == 1 { "" } else { "s" }
         ),
-        Err(e) => format!("⚠️ Could not wake <b>{}</b>: {}", telegram::esc(name), e),
+        Err(e) => format!(
+            "⚠️ Could not wake <b>{}</b>: {}",
+            telegram::esc(name),
+            telegram::esc(e)
+        ),
     }
 }
 
