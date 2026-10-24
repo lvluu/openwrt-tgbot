@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::system;
 use crate::telegram;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 
@@ -171,7 +171,8 @@ pub fn tailscale_report() -> String {
 
 /// message_id of the newest reboot prompt. Process-local on purpose: after a restart it is 0,
 /// so a `reboot_yes` redelivered or tapped on an old prompt can never trigger a reboot.
-static PENDING_REBOOT: AtomicI64 = AtomicI64::new(0);
+/// (A Mutex, not AtomicI64: mipsel has no 64-bit atomics.)
+static PENDING_REBOOT: Mutex<i64> = Mutex::new(0);
 
 fn is_pending_reboot(pending: i64, mid: i64) -> bool {
     pending != 0 && pending == mid
@@ -194,7 +195,7 @@ pub fn reboot_prompt(cfg: &Config) {
             .ok()
             .and_then(|v| v["result"]["message_id"].as_i64())
             .unwrap_or(0);
-        PENDING_REBOOT.store(mid, Ordering::SeqCst);
+        *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()) = mid;
     }
 }
 
@@ -312,12 +313,10 @@ pub fn handle_callback(cfg: &Config, cb: &Value) {
         return;
     }
     if data == "reboot_yes" {
-        let pending = PENDING_REBOOT.load(Ordering::SeqCst);
-        if !is_pending_reboot(pending, mid)
-            || PENDING_REBOOT
-                .compare_exchange(pending, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
+        // Take the pending id so a second tap on the same prompt can't reboot twice.
+        let pending =
+            std::mem::take(&mut *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()));
+        if !is_pending_reboot(pending, mid) {
             let ack = json!({"callback_query_id": cbid, "text": "expired"}).to_string();
             let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
             let edit = json!({"chat_id": chat, "message_id": mid, "text": "This reboot prompt expired. Send /reboot again."})
