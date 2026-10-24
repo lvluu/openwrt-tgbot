@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::system;
 use crate::telegram;
 use serde_json::{json, Value};
+use std::sync::Mutex;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 
@@ -168,6 +169,15 @@ pub fn tailscale_report() -> String {
     format_netmap(&system::sh("tailscale status"))
 }
 
+/// message_id of the newest reboot prompt. Process-local on purpose: after a restart it is 0,
+/// so a `reboot_yes` redelivered or tapped on an old prompt can never trigger a reboot.
+/// (A Mutex, not AtomicI64: mipsel has no 64-bit atomics.)
+static PENDING_REBOOT: Mutex<i64> = Mutex::new(0);
+
+fn is_pending_reboot(pending: i64, mid: i64) -> bool {
+    pending != 0 && pending == mid
+}
+
 pub fn reboot_prompt(cfg: &Config) {
     let payload = json!({
         "chat_id": cfg.chat_id,
@@ -180,7 +190,13 @@ pub fn reboot_prompt(cfg: &Config) {
         }
     })
     .to_string();
-    let _ = telegram::api(cfg, "sendMessage", &payload);
+    if let Some(body) = telegram::api(cfg, "sendMessage", &payload) {
+        let mid = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["result"]["message_id"].as_i64())
+            .unwrap_or(0);
+        *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()) = mid;
+    }
 }
 
 /// The security boundary: only the paired chat may command the bot. An unpaired
@@ -297,9 +313,27 @@ pub fn handle_callback(cfg: &Config, cb: &Value) {
         return;
     }
     if data == "reboot_yes" {
+        // Take the pending id so a second tap on the same prompt can't reboot twice.
+        let pending =
+            std::mem::take(&mut *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()));
+        if !is_pending_reboot(pending, mid) {
+            let ack = json!({"callback_query_id": cbid, "text": "expired"}).to_string();
+            let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
+            let edit = json!({"chat_id": chat, "message_id": mid, "text": "This reboot prompt expired. Send /reboot again."})
+                .to_string();
+            let _ = telegram::api(cfg, "editMessageText", &edit);
+            return;
+        }
         let ack = json!({"callback_query_id": cbid, "text": "rebooting"}).to_string();
         let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
-        telegram::send(cfg, "🔌 Rebooting now. Back in about a minute.");
+        // Editing without reply_markup drops the buttons, so the confirm can't be reused.
+        let edit = json!({
+            "chat_id": chat,
+            "message_id": mid,
+            "text": "🔌 Rebooting now. Back in about a minute.",
+        })
+        .to_string();
+        let _ = telegram::api(cfg, "editMessageText", &edit);
         system::reboot();
     } else {
         let ack = json!({"callback_query_id": cbid, "text": "cancelled"}).to_string();
@@ -322,6 +356,13 @@ mod tests {
             wake_bcasts: Vec::new(),
             path: path.to_string(),
         }
+    }
+
+    #[test]
+    fn reboot_confirm_only_matches_latest_prompt() {
+        assert!(is_pending_reboot(55, 55));
+        assert!(!is_pending_reboot(55, 54));
+        assert!(!is_pending_reboot(0, 0));
     }
 
     #[test]

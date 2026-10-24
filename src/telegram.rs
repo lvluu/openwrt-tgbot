@@ -78,9 +78,25 @@ pub fn get_updates(cfg: &Config, offset: i64, timeout: u64) -> Option<Vec<Value>
     v["result"].as_array().cloned()
 }
 
+/// Offset that acknowledges every update in the batch (highest update_id + 1).
+pub fn next_offset(updates: &[Value], current: i64) -> i64 {
+    updates
+        .iter()
+        .filter_map(|u| u["update_id"].as_i64())
+        .fold(current, |acc, id| acc.max(id + 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_offset_acknowledges_highest_update() {
+        let ups = vec![json!({"update_id": 7}), json!({"update_id": 9}), json!({})];
+        assert_eq!(next_offset(&ups, 0), 10);
+        assert_eq!(next_offset(&ups, 50), 50);
+        assert_eq!(next_offset(&[], 3), 3);
+    }
 
     #[test]
     fn escapes_html_specials() {

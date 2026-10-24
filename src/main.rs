@@ -31,10 +31,17 @@ fn main() {
     loop {
         match telegram::get_updates(&cfg, offset, POLL_TIMEOUT) {
             Some(updates) => {
-                for upd in &updates {
-                    if let Some(id) = upd["update_id"].as_i64() {
-                        offset = id + 1;
+                // Acknowledge the batch before running it: a reboot or crash
+                // mid-batch must not make Telegram redeliver these updates.
+                let next = telegram::next_offset(&updates, offset);
+                if next != offset {
+                    if telegram::get_updates(&cfg, next, 0).is_none() {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
                     }
+                    offset = next;
+                }
+                for upd in &updates {
                     if let Some(msg) = upd.get("message") {
                         let chat = msg["chat"]["id"].as_i64().unwrap_or(0);
                         let text = msg["text"].as_str().unwrap_or("").trim().to_string();
