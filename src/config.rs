@@ -63,8 +63,15 @@ impl Config {
         cfg
     }
 
-    pub fn persist_chat_id(&self) {
-        let s = std::fs::read_to_string(&self.path).unwrap_or_default();
+    /// Rewrite `chat_id=` in the config file, keeping every other line and mode 0600.
+    /// Never writes if the existing file cannot be read; errors are logged and returned.
+    pub fn persist_chat_id(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let s = std::fs::read_to_string(&self.path).map_err(|e| {
+            eprintln!("tgbot: cannot read {}: {e}; not saving chat_id", self.path);
+            e
+        })?;
         let mut out = String::new();
         let mut found = false;
         for line in s.lines() {
@@ -80,9 +87,30 @@ impl Config {
             out.push_str(&format!("chat_id={}\n", self.chat_id));
         }
         let tmp = format!("{}.tmp", self.path);
-        if std::fs::write(&tmp, &out).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
+        // A stale tmp keeps its old mode on reopen, so start from a fresh file.
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("tgbot: cannot remove stale {tmp}: {e}");
+                return Err(e);
+            }
         }
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(out.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &self.path)
+        };
+        write().map_err(|e| {
+            eprintln!("tgbot: cannot save chat_id to {}: {e}", self.path);
+            let _ = std::fs::remove_file(&tmp);
+            e
+        })
     }
 }
 
@@ -118,5 +146,85 @@ mod tests {
         assert!(cfg.wakes.is_empty());
         assert!(cfg.wake_bcasts.is_empty());
         assert_eq!(cfg.chat_id, 0);
+    }
+
+    fn temp_conf(name: &str, body: &str, mode: u32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("tgbot-{}-{name}.conf", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.tmp"));
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn mode_of(path: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    const BODY: &str = "# comment\ntoken=abc\npair_code=xyz\nchat_id=0\nmonitor=10.0.0.2:pc\nwake=02:00:00:00:00:01:node1\n";
+
+    #[test]
+    fn persist_chat_id_keeps_other_keys_and_mode_0600() {
+        let path = temp_conf("persist", BODY, 0o644);
+        let mut cfg = Config::load(&path);
+        cfg.chat_id = 42;
+        cfg.persist_chat_id().unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(s, BODY.replace("chat_id=0", "chat_id=42"));
+        let back = Config::load(&path);
+        assert_eq!((back.chat_id, back.token.as_str()), (42, "abc"));
+        assert_eq!(back.monitors.len(), 1);
+        assert_eq!(back.wakes.len(), 1);
+        assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_chat_id_appends_when_missing() {
+        let path = temp_conf("append", "token=abc\n", 0o600);
+        let mut cfg = Config::load(&path);
+        cfg.chat_id = -7;
+        cfg.persist_chat_id().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "token=abc\nchat_id=-7\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_chat_id_ignores_stale_world_readable_tmp() {
+        let path = temp_conf("stale", BODY, 0o600);
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, "junk").unwrap();
+        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        let mut cfg = Config::load(&path);
+        cfg.chat_id = 5;
+        cfg.persist_chat_id().unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("token=abc"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_chat_id_aborts_when_read_fails() {
+        let path = std::env::temp_dir()
+            .join(format!("tgbot-{}-missing.conf", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = Config::load(&path);
+        cfg.chat_id = 9;
+        assert!(cfg.persist_chat_id().is_err());
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
     }
 }
