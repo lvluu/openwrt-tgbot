@@ -20,6 +20,7 @@ chmod +x /usr/bin/tgbot /etc/init.d/tgbot
 if [ ! -f /etc/tgbot.conf ]; then
 	echo "!! /etc/tgbot.conf missing - create it from openwrt/tgbot.conf.example"
 else
+	chmod 600 /etc/tgbot.conf
 	/etc/init.d/tgbot enable
 	/etc/init.d/tgbot restart
 	sleep 1
