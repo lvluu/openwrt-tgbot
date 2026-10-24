@@ -148,19 +148,31 @@ pub fn reboot_prompt(cfg: &Config) {
     let _ = telegram::api(cfg, "sendMessage", &payload);
 }
 
+/// The security boundary: only the paired chat may command the bot. An unpaired
+/// bot (`chat_id == 0`) trusts nobody, so a callback with no chat id (parsed as 0) fails too.
+fn authorized(cfg: &Config, chat: i64) -> bool {
+    cfg.chat_id != 0 && chat == cfg.chat_id
+}
+
 pub fn handle_message(cfg: &mut Config, chat: i64, text: &str) {
     if cfg.chat_id == 0 {
         if let Some(rest) = text.strip_prefix("/start ") {
             if !cfg.pair_code.is_empty() && rest.trim() == cfg.pair_code {
                 cfg.chat_id = chat;
-                cfg.persist_chat_id();
-                telegram::send(cfg, "✅ Paired. bot is online.");
+                if cfg.persist_chat_id().is_ok() {
+                    telegram::send(cfg, "✅ Paired. bot is online.");
+                } else {
+                    telegram::send(
+                        cfg,
+                        "⚠️ Paired for now, but saving to the config failed. Check logread | grep tgbot.",
+                    );
+                }
                 telegram::send(cfg, HELP);
             }
         }
         return;
     }
-    if chat != cfg.chat_id {
+    if !authorized(cfg, chat) {
         return;
     }
     let parts: Vec<&str> = text.split_whitespace().collect();
@@ -217,7 +229,7 @@ pub fn handle_callback(cfg: &Config, cb: &Value) {
     let chat = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
     let mid = cb["message"]["message_id"].as_i64().unwrap_or(0);
     let cbid = cb["id"].as_str().unwrap_or("").to_string();
-    if chat != cfg.chat_id || cbid.is_empty() {
+    if !authorized(cfg, chat) || cbid.is_empty() {
         return;
     }
     if let Some(mac) = data.strip_prefix("wake:") {
@@ -256,6 +268,54 @@ pub fn handle_callback(cfg: &Config, cb: &Value) {
 
 #[cfg(test)]
 mod tests {
+    fn cfg_with(chat_id: i64, pair_code: &str, path: &str) -> Config {
+        Config {
+            token: String::new(),
+            chat_id,
+            pair_code: pair_code.to_string(),
+            monitors: Vec::new(),
+            wakes: Vec::new(),
+            wake_bcasts: Vec::new(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn authorized_only_for_the_paired_chat() {
+        assert!(authorized(&cfg_with(42, "", ""), 42));
+        assert!(authorized(&cfg_with(-1001, "", ""), -1001));
+        assert!(!authorized(&cfg_with(42, "", ""), 43));
+        assert!(!authorized(&cfg_with(42, "", ""), 0));
+    }
+
+    #[test]
+    fn unpaired_bot_authorizes_nobody() {
+        assert!(!authorized(&cfg_with(0, "code", ""), 0));
+        assert!(!authorized(&cfg_with(0, "code", ""), 42));
+    }
+
+    #[test]
+    fn wrong_pair_code_does_not_pair() {
+        let mut cfg = cfg_with(0, "secret", "/nonexistent/tgbot.conf");
+        handle_message(&mut cfg, 42, "/start wrong");
+        assert_eq!(cfg.chat_id, 0);
+    }
+
+    #[test]
+    fn empty_pair_code_never_pairs() {
+        let mut cfg = cfg_with(0, "", "/nonexistent/tgbot.conf");
+        handle_message(&mut cfg, 42, "/start ");
+        handle_message(&mut cfg, 42, "/start");
+        assert_eq!(cfg.chat_id, 0);
+    }
+
+    #[test]
+    fn paired_bot_ignores_pairing_from_another_chat() {
+        let mut cfg = cfg_with(42, "secret", "/nonexistent/tgbot.conf");
+        handle_message(&mut cfg, 99, "/start secret");
+        assert_eq!(cfg.chat_id, 42);
+    }
+
     use super::*;
 
     fn table(out: &str) -> String {
