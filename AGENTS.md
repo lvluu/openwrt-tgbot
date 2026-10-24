@@ -41,6 +41,9 @@ main.rs   long-poll getUpdates (25s) ──► commands::handle_message / handle
   `handle_callback` must answer with `answerCallbackQuery` or the client spinner hangs.
 - Replies use Telegram HTML parse mode: escape every dynamic string with `telegram::esc`,
   render tables with `tabled` inside `<pre>` (Telegram collapses plain-space alignment).
+  Exception: inline-button `text` is not HTML-parsed, so leave it unescaped. Edits via
+  `editMessageText` need `"parse_mode": "HTML"` too. Raw output (e.g. `/log`) goes through
+  `commands::log_report`.
 
 ## Rules
 

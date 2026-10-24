@@ -36,9 +36,25 @@ pub fn api(cfg: &Config, method: &str, payload: &str) -> Option<String> {
     child.stdin.take()?.write_all(url.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
     if !out.status.success() {
+        eprintln!("tgbot: {} failed: curl exited with {}", method, out.status);
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    if let Some(err) = api_error(&body) {
+        eprintln!("tgbot: {} rejected: {}", method, err);
+    }
+    Some(body)
+}
+
+/// Describes a Telegram `ok:false` reply, or None for a successful (or unparseable) body.
+pub fn api_error(body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    if v["ok"].as_bool() != Some(false) {
+        return None;
+    }
+    let code = v["error_code"].as_i64().unwrap_or(0);
+    let desc = v["description"].as_str().unwrap_or("no description");
+    Some(format!("{} {}", code, desc))
 }
 
 pub fn send(cfg: &Config, text: &str) {
@@ -70,5 +86,17 @@ mod tests {
     fn escapes_html_specials() {
         assert_eq!(esc("a<b>&c\"d"), "a&lt;b&gt;&amp;c\"d");
         assert_eq!(esc("plain-text_1.2"), "plain-text_1.2");
+    }
+
+    #[test]
+    fn api_error_reports_ok_false_only() {
+        let bad =
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}"#;
+        assert_eq!(
+            api_error(bad).as_deref(),
+            Some("400 Bad Request: can't parse entities")
+        );
+        assert_eq!(api_error(r#"{"ok":true,"result":[]}"#), None);
+        assert_eq!(api_error("not json"), None);
     }
 }

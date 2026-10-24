@@ -70,7 +70,11 @@ pub fn wake_report(name: &str, res: &Result<usize, String>) -> String {
             n,
             if *n == 1 { "" } else { "s" }
         ),
-        Err(e) => format!("⚠️ Could not wake <b>{}</b>: {}", telegram::esc(name), e),
+        Err(e) => format!(
+            "⚠️ Could not wake <b>{}</b>: {}",
+            telegram::esc(name),
+            telegram::esc(e)
+        ),
     }
 }
 
@@ -80,7 +84,7 @@ fn wake_keyboard(cfg: &Config) -> Value {
         .iter()
         .map(|(mac, name)| {
             json!([{
-                "text": telegram::esc(name),
+                "text": name,
                 "callback_data": format!("wake:{}", mac),
             }])
         })
@@ -103,6 +107,37 @@ pub fn wake_prompt(cfg: &Config) {
     })
     .to_string();
     let _ = telegram::api(cfg, "sendMessage", &payload);
+}
+
+const MAX_MESSAGE_CHARS: usize = 4096;
+const EMPTY_LOG: &str = "(log is empty)";
+
+/// Escapes log output into a `<pre>` block, dropping the oldest lines so it fits one message.
+pub fn log_report(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return EMPTY_LOG.to_string();
+    }
+    let budget = MAX_MESSAGE_CHARS - "<pre></pre>".len();
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0;
+    for line in raw.lines().rev() {
+        let mut esc = telegram::esc(line);
+        let mut cost = esc.chars().count() + usize::from(!kept.is_empty());
+        if kept.is_empty() && cost > budget {
+            // one line alone is too long: keep its tail; escaping grows a char at most 5x
+            let max_raw = budget / 5;
+            let skip = line.chars().count().saturating_sub(max_raw);
+            esc = telegram::esc(&line.chars().skip(skip).collect::<String>());
+            cost = esc.chars().count();
+        }
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(esc);
+    }
+    kept.reverse();
+    format!("<pre>{}</pre>", kept.join("\n"))
 }
 
 fn preformatted(body: &str) -> String {
@@ -195,7 +230,10 @@ pub fn handle_message(cfg: &mut Config, chat: i64, text: &str) {
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(15)
                 .clamp(5, 60);
-            telegram::send(cfg, &system::sh(&format!("logread | tail -n {}", n)));
+            telegram::send(
+                cfg,
+                &log_report(&system::sh(&format!("logread | tail -n {}", n))),
+            );
         }
         "/restartwifi" => {
             telegram::send(cfg, "🔄 Restarting network...");
@@ -248,7 +286,13 @@ pub fn handle_callback(cfg: &Config, cb: &Value) {
             let (mac_owned, name_owned) = (mac.to_string(), name.clone());
             std::thread::spawn(move || crate::watcher::watch(wcfg, mac_owned, name_owned));
         }
-        let edit = json!({"chat_id": chat, "message_id": mid, "text": text}).to_string();
+        let edit = json!({
+            "chat_id": chat,
+            "message_id": mid,
+            "text": text,
+            "parse_mode": "HTML",
+        })
+        .to_string();
         let _ = telegram::api(cfg, "editMessageText", &edit);
         return;
     }
@@ -317,6 +361,50 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn log_report_escapes_markup() {
+        assert_eq!(log_report("a <b> & c"), "<pre>a &lt;b&gt; &amp; c</pre>");
+    }
+
+    #[test]
+    fn log_report_placeholder_when_empty() {
+        assert_eq!(log_report(""), EMPTY_LOG);
+        assert_eq!(log_report("\n  \n"), EMPTY_LOG);
+    }
+
+    #[test]
+    fn log_report_trims_oldest_lines_to_fit() {
+        let raw: String = (0..200)
+            .map(|i| format!("line {:03} {}\n", i, "x".repeat(40)))
+            .collect();
+        let out = log_report(&raw);
+        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(out.contains("line 199"));
+        assert!(!out.contains("line 000"));
+    }
+
+    #[test]
+    fn log_report_oversize_single_line_stays_within_limit() {
+        let out = log_report(&"<&".repeat(5000));
+        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(out.starts_with("<pre>") && out.ends_with("</pre>"));
+    }
+
+    #[test]
+    fn wake_buttons_keep_raw_names() {
+        let cfg = Config {
+            token: String::new(),
+            chat_id: 0,
+            pair_code: String::new(),
+            monitors: vec![],
+            wakes: vec![("AA:BB:CC:DD:EE:FF".into(), "A&B".into())],
+            wake_bcasts: vec![],
+            path: String::new(),
+        };
+        let kb = wake_keyboard(&cfg);
+        assert_eq!(kb["inline_keyboard"][0][0]["text"], "A&B");
+    }
 
     fn table(out: &str) -> String {
         out.lines()
