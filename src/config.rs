@@ -5,7 +5,7 @@ pub struct Config {
     pub pair_code: String,
     pub monitors: Vec<(String, String)>,
     pub wakes: Vec<(String, String)>,
-    pub wake_bcasts: Vec<String>,
+    pub wake_bcasts: Vec<std::net::Ipv4Addr>,
     pub path: String,
 }
 
@@ -45,9 +45,10 @@ impl Config {
                                 }
                             }
                         }
-                        "wake_bcast" => {
-                            cfg.wake_bcasts.push(v.to_string());
-                        }
+                        "wake_bcast" => match v.parse() {
+                            Ok(a) => cfg.wake_bcasts.push(a),
+                            Err(_) => eprintln!("tgbot: ignoring invalid wake_bcast: {v}"),
+                        },
                         "monitor" => {
                             let (ip, name) = match v.split_once(':') {
                                 Some((a, b)) => (a.to_string(), b.to_string()),
@@ -146,6 +147,21 @@ mod tests {
         assert!(cfg.wakes.is_empty());
         assert!(cfg.wake_bcasts.is_empty());
         assert_eq!(cfg.chat_id, 0);
+    }
+
+    #[test]
+    fn invalid_wake_bcast_is_dropped() {
+        let path = temp_conf(
+            "bcast",
+            "wake_bcast=192.168.1.255\nwake_bcast=192.168.1.256\nwake_bcast=nope\n",
+            0o600,
+        );
+        let cfg = Config::load(&path);
+        assert_eq!(
+            cfg.wake_bcasts,
+            vec![std::net::Ipv4Addr::new(192, 168, 1, 255)]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     fn temp_conf(name: &str, body: &str, mode: u32) -> String {
