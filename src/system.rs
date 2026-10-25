@@ -181,6 +181,14 @@ fn live_entries(only: impl Fn(&(String, String)) -> bool) -> Vec<(String, String
     confirmed_online(&entries, &reachable, ping)
 }
 
+/// One ARP/neigh read and one parallel probe round for a set of IPs.
+pub fn online_among(ips: &[String]) -> Vec<String> {
+    live_entries(|e| ips.contains(&e.0))
+        .into_iter()
+        .map(|e| e.0)
+        .collect()
+}
+
 pub fn online_ips() -> Vec<String> {
     live_entries(|_| true).into_iter().map(|e| e.0).collect()
 }
@@ -188,10 +196,6 @@ pub fn online_ips() -> Vec<String> {
 pub fn online_ip_by_mac(mac: &str) -> Option<String> {
     let mac = mac.to_lowercase();
     live_entries(|e| e.1 == mac).into_iter().next().map(|e| e.0)
-}
-
-pub fn is_online(ip: &str) -> bool {
-    !live_entries(|e| e.0 == ip).is_empty()
 }
 
 pub fn ping(ip: &str) -> bool {

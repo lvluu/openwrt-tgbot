@@ -39,11 +39,13 @@ pub fn run(cfg: Config) {
     }
     let mut state: Vec<bool> = vec![false; cfg.monitors.len()];
     let mut misses: Vec<u32> = vec![0; cfg.monitors.len()];
+    let ips: Vec<String> = cfg.monitors.iter().map(|(ip, _)| ip.clone()).collect();
     let mut first = true;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(20));
+        let seen_ips = system::online_among(&ips);
         for (i, (ip, name)) in cfg.monitors.iter().enumerate() {
-            let seen = system::is_online(ip);
+            let seen = seen_ips.contains(ip);
             let (on, m) = next_presence(state[i], misses[i], seen);
             if !first && on != state[i] {
                 telegram::send(&cfg, &presence_message(name, ip, on));
