@@ -25,7 +25,7 @@ which also sidesteps rustls/ring having no MIPS support). Typical RSS ~4 MB.
 | `/tailscale` | tailnet nodes as an aligned table |
 | `/log [n]` | last n log lines |
 | `/restartwifi` | restart networking |
-| `/reboot` | reboot with an inline confirm/cancel button |
+| `/reboot` | reboot with an inline confirm/cancel button (confirm expires after 60 s) |
 
 Also pushes a message when a `monitor=` device joins or leaves the LAN.
 
