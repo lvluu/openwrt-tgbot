@@ -109,42 +109,93 @@ pub fn wan_ip() -> String {
     "n/a".to_string()
 }
 
-pub fn online_ips() -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(s) = std::fs::read_to_string("/proc/net/arp") {
-        for (i, line) in s.lines().enumerate() {
-            if i == 0 || line.trim().is_empty() {
-                continue;
-            }
+/// Resolved ARP entries as (ip, mac). Flag 0x2 is set for every valid
+/// neighbour state, STALE included, so this is only a candidate list.
+pub fn arp_entries(arp: &str) -> Vec<(String, String)> {
+    arp.lines()
+        .skip(1)
+        .filter_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() >= 6 && f[2] == "0x2" {
-                v.push(f[0].to_string());
-            }
-        }
-    }
-    v
+            (f.len() >= 6 && f[2] == "0x2").then(|| (f[0].to_string(), f[3].to_lowercase()))
+        })
+        .collect()
 }
 
-pub fn parse_arp(arp: &str, want_mac_lower: &str) -> Option<String> {
-    for (i, line) in arp.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() >= 6 && f[2] == "0x2" && f[3].to_lowercase() == want_mac_lower {
-            return Some(f[0].to_string());
+/// IPv4 neighbours the kernel confirmed reachable (`ip neigh` state REACHABLE).
+pub fn reachable_ips(neigh: &str) -> Vec<String> {
+    neigh
+        .lines()
+        .filter_map(|line| {
+            let mut t = line.split_whitespace();
+            let ip = t.next()?;
+            ip.parse::<std::net::Ipv4Addr>().ok()?;
+            (line.split_whitespace().last() == Some("REACHABLE")).then(|| ip.to_string())
+        })
+        .collect()
+}
+
+/// Cap on concurrent pings: low-RAM router, no async runtime.
+const MAX_PARALLEL_PROBES: usize = 8;
+
+/// Online = confirmed REACHABLE, or answers an active probe. Pure so the
+/// state handling is testable; `probe` is only called for unconfirmed entries.
+pub fn confirmed_online(
+    entries: &[(String, String)],
+    reachable: &[String],
+    probe: impl Fn(&str) -> bool + Sync,
+) -> Vec<(String, String)> {
+    let mut up = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for e in entries {
+        if reachable.contains(&e.0) {
+            up.push(e.clone());
+        } else {
+            unconfirmed.push(e);
         }
     }
-    None
+    for batch in unconfirmed.chunks(MAX_PARALLEL_PROBES) {
+        std::thread::scope(|sc| {
+            let probe = &probe;
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|&e| {
+                    std::thread::Builder::new()
+                        .spawn_scoped(sc, move || probe(&e.0))
+                        .ok()
+                })
+                .collect();
+            for (&e, h) in batch.iter().zip(handles) {
+                if h.is_some_and(|h| h.join().unwrap_or(false)) {
+                    up.push(e.clone());
+                }
+            }
+        });
+    }
+    up
+}
+
+fn live_entries(only: impl Fn(&(String, String)) -> bool) -> Vec<(String, String)> {
+    let arp = std::fs::read_to_string("/proc/net/arp").unwrap_or_default();
+    let entries: Vec<_> = arp_entries(&arp).into_iter().filter(only).collect();
+    let reachable = reachable_ips(&sh("ip neigh show"));
+    confirmed_online(&entries, &reachable, ping)
+}
+
+/// One ARP/neigh read and one parallel probe round for a set of IPs.
+pub fn online_among(ips: &[String]) -> Vec<String> {
+    live_entries(|e| ips.contains(&e.0))
+        .into_iter()
+        .map(|e| e.0)
+        .collect()
+}
+
+pub fn online_ips() -> Vec<String> {
+    live_entries(|_| true).into_iter().map(|e| e.0).collect()
 }
 
 pub fn online_ip_by_mac(mac: &str) -> Option<String> {
-    let arp = std::fs::read_to_string("/proc/net/arp").unwrap_or_default();
-    parse_arp(&arp, &mac.to_lowercase())
-}
-
-pub fn is_online(ip: &str) -> bool {
-    online_ips().iter().any(|x| x == ip)
+    let mac = mac.to_lowercase();
+    live_entries(|e| e.1 == mac).into_iter().next().map(|e| e.0)
 }
 
 pub fn ping(ip: &str) -> bool {
@@ -182,18 +233,60 @@ mod tests {
         assert_eq!(parse_mac(""), None);
     }
 
+    const ARP: &str =
+        "IP address       HW type     Flags       HW address            Mask     Device\n\
+         192.168.1.141   0x1         0x2         02:00:00:00:00:10     *        br-lan\n\
+         192.168.1.142   0x1         0x0         aa:bb:cc:dd:ee:ff     *        br-lan\n\
+         192.168.1.143   0x1         0x2         02:00:00:00:00:13     *        br-lan\n";
+
+    const NEIGH: &str = "192.168.1.141 dev br-lan lladdr 02:00:00:00:00:10 REACHABLE\n\
+         192.168.1.143 dev br-lan lladdr 02:00:00:00:00:13 STALE\n\
+         192.168.1.144 dev br-lan lladdr 02:00:00:00:00:14 router REACHABLE\n\
+         192.168.1.145 dev br-lan lladdr 02:00:00:00:00:15 DELAY\n\
+         192.168.1.146 dev br-lan FAILED\n\
+         192.168.1.147 dev br-lan INCOMPLETE\n\
+         fe80::1 dev br-lan lladdr 02:00:00:00:00:99 REACHABLE\n";
+
     #[test]
-    fn parse_arp_finds_complete_entry_only() {
-        let arp =
-            "IP address       HW type     Flags       HW address            Mask     Device\n\
-                   192.168.1.141   0x1         0x2         02:00:00:00:00:10     *        br-lan\n\
-                   192.168.1.142   0x1         0x0         aa:bb:cc:dd:ee:ff     *        br-lan\n";
+    fn arp_entries_keep_resolved_only() {
         assert_eq!(
-            parse_arp(arp, "02:00:00:00:00:10"),
-            Some("192.168.1.141".to_string())
+            arp_entries(ARP),
+            vec![
+                ("192.168.1.141".to_string(), "02:00:00:00:00:10".to_string()),
+                ("192.168.1.143".to_string(), "02:00:00:00:00:13".to_string()),
+            ]
         );
-        assert_eq!(parse_arp(arp, "AA:BB:CC:DD:EE:FF"), None);
-        assert_eq!(parse_arp("", "02:00:00:00:00:10"), None);
+        assert!(arp_entries("").is_empty());
+    }
+
+    #[test]
+    fn reachable_ips_only_counts_reachable_ipv4() {
+        assert_eq!(
+            reachable_ips(NEIGH),
+            vec!["192.168.1.141".to_string(), "192.168.1.144".to_string()]
+        );
+        assert!(reachable_ips("").is_empty());
+    }
+
+    #[test]
+    fn stale_entry_needs_a_successful_probe() {
+        let entries = arp_entries(ARP);
+        let reachable = reachable_ips(NEIGH);
+        let dead = confirmed_online(&entries, &reachable, |_| false);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].0, "192.168.1.141");
+        let alive = confirmed_online(&entries, &reachable, |ip| ip == "192.168.1.143");
+        assert_eq!(alive.len(), 2);
+    }
+
+    #[test]
+    fn reachable_entry_is_not_probed() {
+        let entries = arp_entries(ARP);
+        let up = confirmed_online(&entries, &["192.168.1.141".to_string()], |ip| {
+            assert_ne!(ip, "192.168.1.141", "confirmed entry must not be probed");
+            false
+        });
+        assert_eq!(up.len(), 1);
     }
 
     #[test]

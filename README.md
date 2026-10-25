@@ -29,6 +29,10 @@ which also sidesteps rustls/ring having no MIPS support). Typical RSS ~4 MB.
 
 Also pushes a message when a `monitor=` device joins or leaves the LAN.
 
+"Online" means the kernel confirmed the neighbour (`ip neigh` state REACHABLE) or it answers a ping;
+a stale ARP entry alone does not count. A monitored device is reported offline after two missed
+checks in a row, usually within about a minute and at most ~90 s with default kernel neighbour timers (a device stays REACHABLE for up to ~45 s after power-off). Hosts that drop ICMP while idle can read as offline.
+
 ## Build
 
 ```sh
