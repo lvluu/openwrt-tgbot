@@ -40,7 +40,7 @@ main.rs   long-poll getUpdates (25s) ──► commands::handle_message / handle
 - Inline buttons carry state in `callback_data` (`wake:<MAC>`, `reboot_yes`, `reboot_no`);
   `handle_callback` must answer with `answerCallbackQuery` or the client spinner hangs.
   The decision is the pure `decide_callback` (tested); unknown `callback_data` is ack-only,
-  never a "cancelled" edit. The reboot prompt expires after 60 s (monotonic `Instant`).
+  never a "cancelled" edit. The reboot prompt has a TTL (`REBOOT_TTL`, monotonic `Instant`).
 - Replies use Telegram HTML parse mode: escape every dynamic string with `telegram::esc`,
   render tables with `tabled` inside `<pre>` (Telegram collapses plain-space alignment).
   Exception: inline-button `text` is not HTML-parsed, so leave it unescaped. Edits via
