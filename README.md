@@ -19,7 +19,7 @@ which also sidesteps rustls/ring having no MIPS support). Typical RSS ~4 MB.
 | `/start <pair_code>` | pairs your chat; bot ignores everyone else until then |
 | `/status` | uptime, load, memory, CPU temp, WAN IP, device count |
 | `/clients` | DHCP leases table with 🟢/⚪ online state |
-| `/wake` | clickable buttons, one per machine → sends Wake-on-LAN magic packet, then watches for it to come online |
+| `/wake` | clickable buttons, one per machine → sends a Wake-on-LAN magic packet to the LAN's directed broadcast (derived from netifd's `lan` interface; needs no config, never uses `255.255.255.255`), then watches for it to come online |
 | `/watch <machine>` | watch a machine (by name or MAC) come online for 3 minutes |
 | `/ping <ip>` | LAN reachability check (IP address only) |
 | `/tailscale` | tailnet nodes as an aligned table |
@@ -79,7 +79,7 @@ Config format (`openwrt/tgbot.conf.example`), one `key=value` per line:
 | `pair_code` | secret you send with `/start` to pair |
 | `monitor=<ip>:<name>` | push a message when this device joins/leaves (repeatable) |
 | `wake=<mac>:<name>` | machine offered by `/wake` (repeatable) |
-| `wake_bcast=<addr>` | extra WoL broadcast address, for machines on another subnet (repeatable) |
+| `wake_bcast=<addr>` | extra WoL broadcast address, for machines on another subnet, or the LAN one if auto-detection fails (repeatable; invalid values are logged and ignored) |
 
 ## Security notes
 

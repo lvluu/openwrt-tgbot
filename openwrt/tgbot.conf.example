@@ -5,6 +5,7 @@ pair_code=
 monitor=192.168.1.141:android-tv
 wake=02:00:00:00:00:01:node1
 wake=02:00:00:00:00:03:node3
-wake_bcast=192.168.1.255
-# extra broadcast for a machine on another subnet:
+# the LAN broadcast is auto-detected from netifd; set wake_bcast only for other subnets
+# or when /wake reports "no LAN broadcast address found":
+# wake_bcast=192.168.1.255
 # wake_bcast=192.168.2.255

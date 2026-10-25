@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Command;
 
 pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -16,25 +17,60 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(out)
 }
 
-pub fn wake_all(mac: &str, bcasts: &[String]) -> Result<usize, String> {
-    let bytes = parse_mac(mac).ok_or_else(|| format!("bad mac address: {mac}"))?;
-    let pkt = wake_on_lan::MagicPacket::new(&bytes);
-    let mut sent = 0usize;
-    if pkt.send().is_ok() {
-        sent += 1;
+/// Directed broadcast of the first IPv4 address in a netifd `status` JSON
+/// (`ipv4-address[0]` = `{"address": "192.168.1.1", "mask": 24}`).
+pub fn lan_broadcast_from_status(json: &str) -> Option<Ipv4Addr> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    let entry = &v["ipv4-address"][0];
+    let addr: Ipv4Addr = entry["address"].as_str()?.parse().ok()?;
+    let mask = u32::try_from(entry["mask"].as_u64()?)
+        .ok()
+        .filter(|m| *m <= 30)?;
+    let host_bits = u32::MAX >> mask;
+    Some(Ipv4Addr::from(u32::from(addr) | host_bits))
+}
+
+/// Broadcast address of the LAN interface, or `None` when netifd cannot tell.
+pub fn lan_broadcast() -> Option<Ipv4Addr> {
+    lan_broadcast_from_status(&sh("ubus call network.interface.lan status"))
+}
+
+/// Configured addresses plus the detected LAN broadcast, deduplicated, in that order.
+pub fn wake_targets(configured: &[Ipv4Addr], detected: Option<Ipv4Addr>) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for a in configured.iter().copied().chain(detected) {
+        if !out.contains(&a) {
+            out.push(a);
+        }
     }
-    for b in bcasts {
-        let addr: std::net::SocketAddr = match format!("{b}:9").parse() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        let from: std::net::SocketAddr = "0.0.0.0:0".parse().expect("bind any");
-        if pkt.send_to(addr, from).is_ok() {
-            sent += 1;
+    out
+}
+
+/// Sends the magic packet to each directed broadcast. The unbound limited broadcast
+/// (255.255.255.255) is never used: on a router it follows the default route, not br-lan.
+pub fn wake_all(mac: &str, bcasts: &[Ipv4Addr]) -> Result<usize, String> {
+    let bytes = parse_mac(mac).ok_or_else(|| format!("bad mac address: {mac}"))?;
+    let targets = wake_targets(bcasts, lan_broadcast());
+    if targets.is_empty() {
+        return Err(
+            "no LAN broadcast address found; set wake_bcast=<addr> in /etc/tgbot.conf".to_string(),
+        );
+    }
+    let pkt = wake_on_lan::MagicPacket::new(&bytes);
+    let from = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+    let mut sent = 0usize;
+    let mut last_err = String::new();
+    for t in targets {
+        match pkt.send_to(SocketAddr::from((t, 9)), from) {
+            Ok(()) => sent += 1,
+            Err(e) => {
+                eprintln!("tgbot: wake send to {t} failed: {e}");
+                last_err = format!("{t}: {e}");
+            }
         }
     }
     if sent == 0 {
-        Err("no magic packet could be sent".to_string())
+        Err(format!("magic packet send failed ({last_err})"))
     } else {
         Ok(sent)
     }
@@ -212,6 +248,38 @@ pub fn reboot() {
 
 #[cfg(test)]
 mod tests {
+    const LAN_STATUS: &str = r#"{"up":true,"ipv4-address":[{"address":"192.168.1.1","mask":24}]}"#;
+
+    #[test]
+    fn lan_broadcast_is_derived_from_address_and_mask() {
+        assert_eq!(
+            lan_broadcast_from_status(LAN_STATUS),
+            Some(Ipv4Addr::new(192, 168, 1, 255))
+        );
+        let wide = r#"{"ipv4-address":[{"address":"10.1.2.3","mask":22}]}"#;
+        assert_eq!(
+            lan_broadcast_from_status(wide),
+            Some(Ipv4Addr::new(10, 1, 3, 255))
+        );
+    }
+
+    #[test]
+    fn lan_broadcast_none_without_usable_address() {
+        assert_eq!(lan_broadcast_from_status(""), None);
+        assert_eq!(lan_broadcast_from_status(r#"{"up":false}"#), None);
+        let p2p = r#"{"ipv4-address":[{"address":"10.0.0.1","mask":32}]}"#;
+        assert_eq!(lan_broadcast_from_status(p2p), None);
+    }
+
+    #[test]
+    fn wake_targets_dedupes_and_never_uses_limited_broadcast() {
+        let a = Ipv4Addr::new(192, 168, 1, 255);
+        let b = Ipv4Addr::new(192, 168, 2, 255);
+        assert_eq!(wake_targets(&[a, b], Some(a)), vec![a, b]);
+        assert_eq!(wake_targets(&[b], Some(a)), vec![b, a]);
+        assert!(wake_targets(&[], None).is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -293,7 +361,7 @@ mod tests {
     fn wake_all_validates_before_sending() {
         assert!(wake_all("nope", &[]).is_err());
         assert!(wake_all("02:00:00:00", &[]).is_err());
-        assert!(wake_all("02:00:00:00:00:01", &[]).is_ok());
+        assert_eq!(wake_all("02:00:00:00:00:01", &[Ipv4Addr::LOCALHOST]), Ok(1));
     }
 
     #[test]
