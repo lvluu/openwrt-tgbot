@@ -3,6 +3,7 @@ use crate::system;
 use crate::telegram;
 use serde_json::{json, Value};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tabled::builder::Builder;
 use tabled::settings::Style;
 
@@ -169,13 +170,66 @@ pub fn tailscale_report() -> String {
     format_netmap(&system::sh("tailscale status"))
 }
 
-/// message_id of the newest reboot prompt. Process-local on purpose: after a restart it is 0,
-/// so a `reboot_yes` redelivered or tapped on an old prompt can never trigger a reboot.
-/// (A Mutex, not AtomicI64: mipsel has no 64-bit atomics.)
-static PENDING_REBOOT: Mutex<i64> = Mutex::new(0);
+/// How long a reboot prompt stays confirmable.
+const REBOOT_TTL: Duration = Duration::from_secs(60);
 
-fn is_pending_reboot(pending: i64, mid: i64) -> bool {
-    pending != 0 && pending == mid
+/// The newest reboot prompt. Monotonic `Instant`, not wall time: routers boot with a wrong
+/// clock that jumps on NTP sync.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingReboot {
+    mid: i64,
+    issued: Instant,
+}
+
+/// Process-local on purpose: after a restart it is `None`, so a `reboot_yes` redelivered or
+/// tapped on an old prompt can never trigger a reboot.
+static PENDING_REBOOT: Mutex<Option<PendingReboot>> = Mutex::new(None);
+
+/// What `handle_callback` must do for one callback query. Pure data, so it is testable.
+#[derive(Debug, PartialEq)]
+enum CallbackAction {
+    /// Unauthorized chat or no callback id: no reply at all.
+    Silent,
+    /// Unrecognised `callback_data`: answer the query (no spinner) but edit nothing.
+    AckOnly,
+    Wake(String),
+    Reboot,
+    Expired,
+    Cancel,
+}
+
+/// Decides the action and updates the pending prompt. `reboot_yes` consumes the pending
+/// prompt whatever the outcome, so a second tap can never reboot twice.
+fn decide_callback(
+    cfg: &Config,
+    chat: i64,
+    cbid: &str,
+    data: &str,
+    mid: i64,
+    pending: &mut Option<PendingReboot>,
+    now: Instant,
+) -> CallbackAction {
+    if !authorized(cfg, chat) || cbid.is_empty() {
+        return CallbackAction::Silent;
+    }
+    if let Some(mac) = data.strip_prefix("wake:") {
+        return CallbackAction::Wake(mac.to_string());
+    }
+    match data {
+        "reboot_yes" => match pending.take() {
+            Some(p) if p.mid == mid && now.saturating_duration_since(p.issued) <= REBOOT_TTL => {
+                CallbackAction::Reboot
+            }
+            _ => CallbackAction::Expired,
+        },
+        "reboot_no" => {
+            if pending.is_some_and(|p| p.mid == mid) {
+                *pending = None;
+            }
+            CallbackAction::Cancel
+        }
+        _ => CallbackAction::AckOnly,
+    }
 }
 
 pub fn reboot_prompt(cfg: &Config) {
@@ -193,9 +247,11 @@ pub fn reboot_prompt(cfg: &Config) {
     if let Some(body) = telegram::api(cfg, "sendMessage", &payload) {
         let mid = serde_json::from_str::<Value>(&body)
             .ok()
-            .and_then(|v| v["result"]["message_id"].as_i64())
-            .unwrap_or(0);
-        *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()) = mid;
+            .and_then(|v| v["result"]["message_id"].as_i64());
+        *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()) = mid.map(|mid| PendingReboot {
+            mid,
+            issued: Instant::now(),
+        });
     }
 }
 
@@ -279,68 +335,57 @@ pub fn handle_message(cfg: &mut Config, chat: i64, text: &str) {
 }
 
 pub fn handle_callback(cfg: &Config, cb: &Value) {
-    let data = cb["data"].as_str().unwrap_or("").to_string();
+    let data = cb["data"].as_str().unwrap_or("");
     let chat = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
     let mid = cb["message"]["message_id"].as_i64().unwrap_or(0);
-    let cbid = cb["id"].as_str().unwrap_or("").to_string();
-    if !authorized(cfg, chat) || cbid.is_empty() {
-        return;
-    }
-    if let Some(mac) = data.strip_prefix("wake:") {
-        let name = cfg
-            .wakes
-            .iter()
-            .find(|(m, _)| m == mac)
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| mac.to_string());
-        let ack = json!({"callback_query_id": cbid, "text": "sending magic packet"}).to_string();
+    let cbid = cb["id"].as_str().unwrap_or("");
+    let action = {
+        let mut pending = PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner());
+        decide_callback(cfg, chat, cbid, data, mid, &mut pending, Instant::now())
+    };
+    let answer = |text: &str| {
+        let ack = json!({"callback_query_id": cbid, "text": text}).to_string();
         let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
-        let res = system::wake_all(mac, &cfg.wake_bcasts);
-        let text = wake_report(&name, &res);
-        if res.is_ok() {
-            let wcfg = cfg.clone();
-            let (mac_owned, name_owned) = (mac.to_string(), name.clone());
-            std::thread::spawn(move || crate::watcher::watch(wcfg, mac_owned, name_owned));
-        }
-        let edit = json!({
-            "chat_id": chat,
-            "message_id": mid,
-            "text": text,
-            "parse_mode": "HTML",
-        })
-        .to_string();
-        let _ = telegram::api(cfg, "editMessageText", &edit);
-        return;
-    }
-    if data == "reboot_yes" {
-        // Take the pending id so a second tap on the same prompt can't reboot twice.
-        let pending =
-            std::mem::take(&mut *PENDING_REBOOT.lock().unwrap_or_else(|e| e.into_inner()));
-        if !is_pending_reboot(pending, mid) {
-            let ack = json!({"callback_query_id": cbid, "text": "expired"}).to_string();
-            let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
-            let edit = json!({"chat_id": chat, "message_id": mid, "text": "This reboot prompt expired. Send /reboot again."})
+    };
+    let edit = |text: &str| {
+        let payload =
+            json!({"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML"})
                 .to_string();
-            let _ = telegram::api(cfg, "editMessageText", &edit);
-            return;
+        let _ = telegram::api(cfg, "editMessageText", &payload);
+    };
+    match action {
+        CallbackAction::Silent => {}
+        CallbackAction::AckOnly => answer(""),
+        CallbackAction::Wake(mac) => {
+            let name = cfg
+                .wakes
+                .iter()
+                .find(|(m, _)| *m == mac)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| mac.clone());
+            answer("sending magic packet");
+            let res = system::wake_all(&mac, &cfg.wake_bcasts);
+            if res.is_ok() {
+                let wcfg = cfg.clone();
+                let name_owned = name.clone();
+                std::thread::spawn(move || crate::watcher::watch(wcfg, mac, name_owned));
+            }
+            edit(&wake_report(&name, &res));
         }
-        let ack = json!({"callback_query_id": cbid, "text": "rebooting"}).to_string();
-        let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
-        // Editing without reply_markup drops the buttons, so the confirm can't be reused.
-        let edit = json!({
-            "chat_id": chat,
-            "message_id": mid,
-            "text": "🔌 Rebooting now. Back in about a minute.",
-        })
-        .to_string();
-        let _ = telegram::api(cfg, "editMessageText", &edit);
-        system::reboot();
-    } else {
-        let ack = json!({"callback_query_id": cbid, "text": "cancelled"}).to_string();
-        let _ = telegram::api(cfg, "answerCallbackQuery", &ack);
-        let edit =
-            json!({"chat_id": chat, "message_id": mid, "text": "Reboot cancelled."}).to_string();
-        let _ = telegram::api(cfg, "editMessageText", &edit);
+        CallbackAction::Expired => {
+            answer("expired");
+            edit("This reboot prompt expired. Send /reboot again.");
+        }
+        CallbackAction::Reboot => {
+            answer("rebooting");
+            // Editing without reply_markup drops the buttons, so the confirm can't be reused.
+            edit("🔌 Rebooting now. Back in about a minute.");
+            system::reboot();
+        }
+        CallbackAction::Cancel => {
+            answer("cancelled");
+            edit("Reboot cancelled.");
+        }
     }
 }
 
@@ -358,11 +403,150 @@ mod tests {
         }
     }
 
+    fn pending(mid: i64, issued: Instant) -> Option<PendingReboot> {
+        Some(PendingReboot { mid, issued })
+    }
+
+    fn decide(
+        chat: i64,
+        cbid: &str,
+        data: &str,
+        mid: i64,
+        p: &mut Option<PendingReboot>,
+        now: Instant,
+    ) -> CallbackAction {
+        decide_callback(&cfg_with(42, "", ""), chat, cbid, data, mid, p, now)
+    }
+
     #[test]
-    fn reboot_confirm_only_matches_latest_prompt() {
-        assert!(is_pending_reboot(55, 55));
-        assert!(!is_pending_reboot(55, 54));
-        assert!(!is_pending_reboot(0, 0));
+    fn reboot_yes_on_matching_prompt_reboots() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        assert_eq!(
+            decide(42, "c", "reboot_yes", 55, &mut p, t0),
+            CallbackAction::Reboot
+        );
+    }
+
+    #[test]
+    fn stale_message_id_does_not_reboot() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        assert_eq!(
+            decide(42, "c", "reboot_yes", 54, &mut p, t0),
+            CallbackAction::Expired
+        );
+        assert_eq!(
+            p, None,
+            "a mismatched tap still consumes the prompt (fails safe)"
+        );
+    }
+
+    #[test]
+    fn no_pending_prompt_does_not_reboot() {
+        assert_eq!(
+            decide(42, "c", "reboot_yes", 0, &mut None, Instant::now()),
+            CallbackAction::Expired
+        );
+    }
+
+    #[test]
+    fn other_chat_is_silent_and_keeps_prompt() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        assert_eq!(
+            decide(99, "c", "reboot_yes", 55, &mut p, t0),
+            CallbackAction::Silent
+        );
+        assert_eq!(
+            decide(0, "c", "reboot_yes", 55, &mut p, t0),
+            CallbackAction::Silent
+        );
+        assert_eq!(p, pending(55, t0));
+    }
+
+    #[test]
+    fn missing_callback_id_is_silent() {
+        let t0 = Instant::now();
+        assert_eq!(
+            decide(42, "", "reboot_yes", 55, &mut pending(55, t0), t0),
+            CallbackAction::Silent
+        );
+    }
+
+    #[test]
+    fn double_tap_reboots_exactly_once() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        let actions: Vec<CallbackAction> = (0..2)
+            .map(|_| decide(42, "c", "reboot_yes", 55, &mut p, t0))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![CallbackAction::Reboot, CallbackAction::Expired]
+        );
+    }
+
+    #[test]
+    fn unknown_callback_data_is_ack_only() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        for data in ["", "garbage", "reboot_YES", "wake"] {
+            assert_eq!(
+                decide(42, "c", data, 55, &mut p, t0),
+                CallbackAction::AckOnly,
+                "{data:?}"
+            );
+        }
+        assert_eq!(p, pending(55, t0), "unknown data must not touch the prompt");
+    }
+
+    #[test]
+    fn reboot_prompt_expires_after_ttl() {
+        let t0 = Instant::now();
+        let just_in = t0 + REBOOT_TTL;
+        let too_late = t0 + REBOOT_TTL + Duration::from_secs(1);
+        assert_eq!(
+            decide(42, "c", "reboot_yes", 55, &mut pending(55, t0), just_in),
+            CallbackAction::Reboot
+        );
+        let mut p = pending(55, t0);
+        assert_eq!(
+            decide(42, "c", "reboot_yes", 55, &mut p, too_late),
+            CallbackAction::Expired
+        );
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn cancel_clears_only_its_own_prompt() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        assert_eq!(
+            decide(42, "c", "reboot_no", 54, &mut p, t0),
+            CallbackAction::Cancel
+        );
+        assert_eq!(p, pending(55, t0));
+        assert_eq!(
+            decide(42, "c", "reboot_no", 55, &mut p, t0),
+            CallbackAction::Cancel
+        );
+        assert_eq!(p, None);
+        assert_eq!(
+            decide(42, "c", "reboot_yes", 55, &mut p, t0),
+            CallbackAction::Expired
+        );
+    }
+
+    #[test]
+    fn wake_leaves_pending_reboot_alone() {
+        let t0 = Instant::now();
+        let mut p = pending(55, t0);
+        assert_eq!(
+            decide(42, "c", "wake:AA:BB", 7, &mut p, t0),
+            CallbackAction::Wake("AA:BB".to_string())
+        );
+        assert_eq!(p, pending(55, t0));
     }
 
     #[test]
