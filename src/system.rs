@@ -134,6 +134,9 @@ pub fn reachable_ips(neigh: &str) -> Vec<String> {
         .collect()
 }
 
+/// Cap on concurrent pings: low-RAM router, no async runtime.
+const MAX_PARALLEL_PROBES: usize = 8;
+
 /// Online = confirmed REACHABLE, or answers an active probe. Pure so the
 /// state handling is testable; `probe` is only called for unconfirmed entries.
 pub fn confirmed_online(
@@ -141,21 +144,34 @@ pub fn confirmed_online(
     reachable: &[String],
     probe: impl Fn(&str) -> bool + Sync,
 ) -> Vec<(String, String)> {
-    std::thread::scope(|sc| {
-        let probe = &probe;
-        let handles: Vec<_> = entries
-            .iter()
-            .map(|e| {
-                let confirmed = reachable.contains(&e.0);
-                sc.spawn(move || confirmed || probe(&e.0))
-            })
-            .collect();
-        entries
-            .iter()
-            .zip(handles)
-            .filter_map(|(e, h)| h.join().unwrap_or(false).then(|| e.clone()))
-            .collect()
-    })
+    let mut up = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for e in entries {
+        if reachable.contains(&e.0) {
+            up.push(e.clone());
+        } else {
+            unconfirmed.push(e);
+        }
+    }
+    for batch in unconfirmed.chunks(MAX_PARALLEL_PROBES) {
+        std::thread::scope(|sc| {
+            let probe = &probe;
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|&e| {
+                    std::thread::Builder::new()
+                        .spawn_scoped(sc, move || probe(&e.0))
+                        .ok()
+                })
+                .collect();
+            for (&e, h) in batch.iter().zip(handles) {
+                if h.is_some_and(|h| h.join().unwrap_or(false)) {
+                    up.push(e.clone());
+                }
+            }
+        });
+    }
+    up
 }
 
 fn live_entries(only: impl Fn(&(String, String)) -> bool) -> Vec<(String, String)> {
