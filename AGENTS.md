@@ -15,8 +15,13 @@ Agent operating knowledge only. Each fact lives in one place:
 ```sh
 cargo fmt && cargo clippy --release -- -D warnings && cargo test --release   # what CI runs
 cargo test --release parses_wake                                            # one test by name filter
+blaze build --release                                                       # host edit loop, ~0.1 s rebuild
 ./build.sh && ./deploy.sh                                                   # ship to the router
 ```
+
+blaze (`./build.sh host` picks it when installed) only builds and formats here: `blaze test` and
+`blaze clippy` fail on this crate (blaze cannot compile `std::thread::spawn` paths yet), and it has
+no MIPS backend. Tests, clippy, the router build and CI stay on cargo.
 
 Unit tests cover pure logic only (parsers, table/message rendering). Anything touching
 `/proc`, `ubus`, `ping`, `curl` or Telegram is verified on the router: `logread | grep tgbot`.

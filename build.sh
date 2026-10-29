@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 
 if [ "${1:-}" = "host" ]; then
 	shift
-	cargo build --release "$@"
+	# blaze (https://github.com/indexable-inc/blaze) rebuilds in ~0.1 s; cargo when it is not installed
+	"$(command -v blaze || echo cargo)" build --release "$@"
 	exit 0
 fi
 

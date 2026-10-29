@@ -37,8 +37,12 @@ checks in a row, usually within about a minute and at most ~90 s with default ke
 
 ```sh
 ./build.sh          # cross-compile for the router (nightly + build-std)
-./build.sh host     # native build
+./build.sh host     # native build: blaze when installed, else cargo
 ```
+
+For the host edit loop, [blaze](https://github.com/indexable-inc/blaze)
+(`curl -fsSL https://ix.dev/blaze | sh`) rebuilds after an edit in about 0.1 s. It has no MIPS
+backend, so the router build and CI stay on cargo.
 
 Requirements: Rust nightly with `rust-src` (`rustup toolchain install nightly --component rust-src`)
 and a mipsel soft-float musl cross toolchain:
